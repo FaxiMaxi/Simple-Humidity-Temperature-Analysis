@@ -5,196 +5,245 @@ import numpy as np
 import warnings
 from streamlit_gsheets import GSheetsConnection
 
-# -----------------------------------------------------------------------------
-# 1. Configuration & Global Settings
-# -----------------------------------------------------------------------------
-# Suppress pandas warnings about future behavior
-warnings.filterwarnings("ignore", category=FutureWarning, message="The behavior of DataFrame concatenation")
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message="The behavior of DataFrame concatenation",
+)
 
 st.set_page_config(
     page_title="Sensor Analytics Cloud",
     page_icon="☁️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Custom CSS
-st.markdown("""
+st.markdown(
+    """
 <style>
-    /* Ensure sidebar toggle remains visible */
-    div.block-container {padding-top: 2rem;}
+  div.block-container {padding-top: 2rem;}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# -----------------------------------------------------------------------------
-# 2. Logic: Data Processing & Cleaning
-# -----------------------------------------------------------------------------
-def normalize_columns(df):
-    """Ensures consistent column names."""
-    df = df.copy()
-    expected_cols = ['Time', 'Sensor ID', 'Temperature', 'Humidity']
-    # If columns don't match names but count is right, rename them
-    if len(df.columns) >= 4:
-        # Create a map only for the first 4 columns
-        rename_map = {df.columns[i]: expected_cols[i] for i in range(4)}
-        df = df.rename(columns=rename_map)
-    return df
-
-def process_data(df_input):
-    df = df_input.copy()
-    
-    # --- A. Time Column Cleanup ---
-    if 'Time' in df.columns:
-        # 1. Convert to string & strip spaces
-        df['Time'] = df['Time'].astype(str).str.strip()
-        # 2. Replace empty/nan strings with actual NaN
-        df['Time'] = df['Time'].replace(['nan', 'None', '', 'NaT'], np.nan)
-        # 3. Forward Fill (Gap Filling)
-        df['Time'] = df['Time'].ffill()
-    
-    # --- B. Datetime Conversion (Robust) ---
-    # Strategy: Try fast format first, fall back to flexible parser
-    df['Datetime'] = pd.to_datetime(df['Time'], format='%H:%M', errors='coerce')
-    
-    # Fallback for mixed inputs (e.g. 10:00:05 or 10:00 AM)
-    mask_nat = df['Datetime'].isna() & df['Time'].notna()
-    if mask_nat.any():
-        df.loc[mask_nat, 'Datetime'] = pd.to_datetime(df.loc[mask_nat, 'Time'], errors='coerce')
-    
-    # --- C. Numeric Conversion (Comma Support) ---
-    cols_to_numeric = ['Sensor ID', 'Temperature', 'Humidity']
-    for col in cols_to_numeric:
-        if col in df.columns:
-            # Replace comma with dot for EU format (e.g. "10,5" -> "10.5")
-            df[col] = df[col].astype(str).str.replace(',', '.', regex=False)
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    return df
-
-# -----------------------------------------------------------------------------
-# 3. Data Loading (Google Sheets)
-# -----------------------------------------------------------------------------
-st.sidebar.header("📂 Cloud Data")
-
-# Initialize Connection
-# This looks for [connections.gsheets] in .streamlit/secrets.toml
+# ---------- Google Sheets connection ----------
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-@st.cache_data(ttl=5) # Cache data for 5 seconds to prevent spamming API
-def load_data():
-    try:
-        # Read from the default spreadsheet URL in secrets
-        df = conn.read(worksheet="Sheet1")
-        return df
-    except Exception as e:
-        st.error(f"Error connecting to Google Sheets: {e}")
-        return pd.DataFrame()
+# Expect this to exist in secrets.toml:
+# [connections.gsheets]
+# spreadsheet = "https://docs.google.com/spreadsheets/d/...."
+SPREADSHEET = st.secrets["connections"]["gsheets"]["spreadsheet"]
 
-# Button to manually refresh
-if st.sidebar.button("🔄 Refresh Data"):
-    st.cache_data.clear()
+
+# ---------- Helpers ----------
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Supports two layouts:
+      A) Time, Sensor ID, Temperature, Humidity
+      B) Row, Time, Sensor ID, Temperature, Humidity   (recommended)
+    Renames by *position* to avoid header mismatch issues.
+    """
+    df = df.copy()
+    cols = list(df.columns)
+
+    if len(cols) >= 5:
+        rename_map = {
+            cols[0]: "Row",
+            cols[1]: "Time",
+            cols[2]: "Sensor ID",
+            cols[3]: "Temperature",
+            cols[4]: "Humidity",
+        }
+        return df.rename(columns=rename_map)
+
+    if len(cols) >= 4:
+        rename_map = {
+            cols[0]: "Time",
+            cols[1]: "Sensor ID",
+            cols[2]: "Temperature",
+            cols[3]: "Humidity",
+        }
+        return df.rename(columns=rename_map)
+
+    return df
+
+
+def ensure_row_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensures there is a 'Row' column and it is filled with integers.
+    - Existing Row values are preserved.
+    - Missing Row values are auto-assigned (max+1 ...).
+    """
+    df = df.copy()
+
+    if "Row" not in df.columns:
+        df.insert(0, "Row", range(1, len(df) + 1))
+        return df
+
+    df["Row"] = pd.to_numeric(df["Row"], errors="coerce")
+    max_existing = int(df["Row"].dropna().max()) if df["Row"].notna().any() else 0
+
+    missing = df["Row"].isna()
+    if missing.any():
+        new_ids = range(max_existing + 1, max_existing + 1 + int(missing.sum()))
+        df.loc[missing, "Row"] = list(new_ids)
+
+    df["Row"] = df["Row"].astype(int)
+    df = df.sort_values("Row", kind="stable").reset_index(drop=True)
+    return df
+
+
+def process_data(df_input: pd.DataFrame) -> pd.DataFrame:
+    df = df_input.copy()
+
+    # Keep Row numeric if present
+    if "Row" in df.columns:
+        df["Row"] = pd.to_numeric(df["Row"], errors="coerce")
+
+    # --- Time cleanup + forward-fill ---
+    if "Time" in df.columns:
+        df["Time"] = df["Time"].astype(str).str.strip()
+        df["Time"] = df["Time"].replace(["nan", "None", "", "NaT"], np.nan)
+        df["Time"] = df["Time"].ffill()
+
+    # --- Datetime conversion (fast path + fallback) ---
+    df["Datetime"] = pd.to_datetime(df.get("Time", pd.Series(dtype="object")), format="%H:%M", errors="coerce")
+    mask_nat = df["Datetime"].isna() & df.get("Time", pd.Series(dtype="object")).notna()
+    if mask_nat.any():
+        df.loc[mask_nat, "Datetime"] = pd.to_datetime(df.loc[mask_nat, "Time"], errors="coerce")
+
+    # --- Numeric conversion + comma decimal support ---
+    for col in ["Sensor ID", "Temperature", "Humidity"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.replace(",", ".", regex=False)
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
+def get_worksheet_titles() -> list[str]:
+    """
+    List worksheet/tab names via the underlying gspread client.
+    This uses internal attributes of st-gsheets-connection, but is stable in practice.
+    """
+    client = conn.client  # underlying GSheetsServiceAccountClient when using service_account
+    # Open spreadsheet using the URL in secrets
+    ss = client._open_spreadsheet(spreadsheet=SPREADSHEET)  # private helper in library
+    return [ws.title for ws in ss.worksheets()]
+
+
+# ---------- Sidebar: pick worksheet tab ----------
+st.sidebar.header("Google Sheet tabs")
+
+try:
+    titles = get_worksheet_titles()
+except Exception as e:
+    st.sidebar.error(f"Could not list worksheet tabs: {e}")
+    titles = ["Sheet1"]
+
+selected_ws = st.sidebar.radio(
+    "Select worksheet (tab)",
+    options=titles,
+    index=0 if "Sheet1" not in titles else titles.index("Sheet1"),
+)
+
+refresh = st.sidebar.button("🔄 Refresh", type="secondary")
+if refresh:
     st.rerun()
 
-# Load the data
-df_raw = load_data()
+# ---------- Load from selected worksheet ----------
+# Use a short ttl so changes appear quickly; gsheets-connection supports ttl on read(). [page:1]
+df_raw = conn.read(worksheet=selected_ws, ttl=5)
 
-# Helper: Create empty structure if sheet is totally blank
-if df_raw.empty:
-    df_raw = pd.DataFrame({
-        'Time': ['10:00', '10:05'], 
-        'Sensor ID': [1, 2], 
-        'Temperature': [20.5, 21.0], 
-        'Humidity': [50, 55]
-    })
+# If the tab is empty, create a starter frame
+if df_raw is None or df_raw.empty:
+    df_raw = pd.DataFrame(
+        {
+            "Row": [1, 2, 3, 4],
+            "Time": ["10:00", "", "", ""],
+            "Sensor ID": [1, 2, 3, 4],
+            "Temperature": [20.5, 21.0, 19.5, 20.2],
+            "Humidity": [45, 46, 50, 44],
+        }
+    )
 
-# Normalize headers (in case Sheet headers are wrong)
 df_raw = normalize_columns(df_raw)
+df_raw = ensure_row_column(df_raw)
 
-# -----------------------------------------------------------------------------
-# 4. Main Interface
-# -----------------------------------------------------------------------------
+# ---------- Main UI ----------
 st.title("📊 Sensor Analytics (Cloud)")
+st.caption(f"Active worksheet: {selected_ws}")
 
-# --- EDITOR & SAVE ---
-col_edit, col_save = st.columns([4, 1])
-with col_edit:
-    st.subheader("📝 Live Data Editor")
-    st.caption("Changes are saved directly to Google Sheets.")
-with col_save:
-    save_clicked = st.button("💾 Save to Cloud", type="primary", use_container_width=True)
+c_left, c_right = st.columns([4, 1])
+with c_left:
+    st.subheader("📝 Data Editor")
+    st.caption("Row IDs are auto-managed. Time blanks are forward-filled for analysis.")
+with c_right:
+    save_clicked = st.button("💾 Save", type="primary")  # keep simple; no deprecated width args
 
-# Data Editor
 edited_df = st.data_editor(
     df_raw,
     num_rows="dynamic",
     width="stretch",
-    key="editor"
+    key=f"editor_{selected_ws}",
+    column_config={
+        "Row": st.column_config.NumberColumn("Row", help="Auto-generated unique row id", disabled=True),
+    },
 )
 
-# SAVE LOGIC
+# Save: ensure Row IDs exist before writing
 if save_clicked:
     try:
-        with st.spinner("Saving to Google Sheets..."):
-            # Update the Google Sheet with current editor data
-            conn.update(worksheet="Sheet1", data=edited_df)
-            st.success("✅ Saved successfully!")
-            st.cache_data.clear() # Clear cache so next load gets new data
+        to_save = normalize_columns(edited_df)
+        to_save = ensure_row_column(to_save)
+        # Write back to the chosen worksheet. update() clears then writes the dataframe. [page:1]
+        conn.update(worksheet=selected_ws, data=to_save)
+        st.success("Saved to Google Sheets.")
     except Exception as e:
-        st.error(f"❌ Save failed: {e}")
+        st.error(f"Save failed: {e}")
 
-# -----------------------------------------------------------------------------
-# 5. Analytics & Visualization
-# -----------------------------------------------------------------------------
-# Process data for plotting
+# ---------- Build plots ----------
 try:
-    df = process_data(edited_df)
-    # Filter valid rows for plotting
-    plot_df = df.dropna(subset=['Datetime', 'Sensor ID']).sort_values(by=['Datetime', 'Sensor ID'])
+    df = process_data(ensure_row_column(normalize_columns(edited_df)))
+    plot_df = df.dropna(subset=["Datetime", "Sensor ID"]).sort_values(["Datetime", "Sensor ID"])
 except Exception as e:
-    st.error(f"Processing Error: {e}")
+    st.error(f"Processing error: {e}")
     plot_df = pd.DataFrame()
 
 if plot_df.empty:
-    st.warning("No valid data to visualize.")
+    st.warning("No valid data to visualize (check Time + Sensor ID columns).")
     st.stop()
-
-# --- PLOTS ---
-st.divider()
-st.subheader("📈 Analytics")
 
 def configure_chart(fig):
     fig.update_xaxes(tickformat="%H:%M", showgrid=True)
     return fig
 
-# A. Averages
-avg_df = plot_df.groupby('Datetime')[['Temperature', 'Humidity']].mean().reset_index()
-c1, c2 = st.columns(2)
-
-fig_t = px.area(avg_df, x='Datetime', y='Temperature', title="Avg Temp (°C)", 
-                color_discrete_sequence=['#FF4B4B'], markers=True)
-c1.plotly_chart(configure_chart(fig_t), width="stretch", key="avg_temp")
-
-fig_h = px.area(avg_df, x='Datetime', y='Humidity', title="Avg Humidity (%)", 
-                color_discrete_sequence=['#0068C9'], markers=True)
-c2.plotly_chart(configure_chart(fig_h), width="stretch", key="avg_hum")
-
-# B. Individual Sensors
 st.divider()
-sensors = sorted(plot_df['Sensor ID'].unique())
+st.subheader("📈 Network averages")
 
-if sensors:
-    tabs = st.tabs([f"Sensor {int(s)}" for s in sensors])
-    for tab, sid in zip(tabs, sensors):
-        with tab:
-            s_data = plot_df[plot_df['Sensor ID'] == sid]
-            col_a, col_b = st.columns(2)
-            
-            # Temp
-            ft = px.line(s_data, x='Datetime', y='Temperature', title="Temperature", 
-                         markers=True, color_discrete_sequence=['#FF4B4B'])
-            col_a.plotly_chart(configure_chart(ft), width="stretch", key=f"temp_{sid}")
-            
-            # Humidity
-            fh = px.line(s_data, x='Datetime', y='Humidity', title="Humidity", 
-                         markers=True, color_discrete_sequence=['#0068C9'])
-            col_b.plotly_chart(configure_chart(fh), width="stretch", key=f"hum_{sid}")
+avg_df = plot_df.groupby("Datetime")[["Temperature", "Humidity"]].mean().reset_index()
+col1, col2 = st.columns(2)
+
+fig_avg_temp = px.area(avg_df, x="Datetime", y="Temperature", title="Avg Temperature (°C)", markers=True)
+col1.plotly_chart(configure_chart(fig_avg_temp), width="stretch", key=f"avg_temp_{selected_ws}")
+
+fig_avg_hum = px.area(avg_df, x="Datetime", y="Humidity", title="Avg Humidity (%)", markers=True)
+col2.plotly_chart(configure_chart(fig_avg_hum), width="stretch", key=f"avg_hum_{selected_ws}")
+
+st.divider()
+st.subheader("🔍 Individual sensors")
+
+sensors = sorted([s for s in plot_df["Sensor ID"].unique() if pd.notna(s)])
+tabs = st.tabs([f"Sensor {int(s)}" for s in sensors])
+
+for tab, sid in zip(tabs, sensors):
+    with tab:
+        s_data = plot_df[plot_df["Sensor ID"] == sid]
+        a, b = st.columns(2)
+
+        fig_t = px.line(s_data, x="Datetime", y="Temperature", title="Temperature", markers=True)
+        a.plotly_chart(configure_chart(fig_t), width="stretch", key=f"temp_{selected_ws}_{sid}")
+
+        fig_h = px.line(s_data, x="Datetime", y="Humidity", title="Humidity", markers=True)
+        b.plotly_chart(configure_chart(fig_h), width="stretch", key=f"hum_{selected_ws}_{sid}")
