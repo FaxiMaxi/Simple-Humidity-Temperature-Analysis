@@ -5,6 +5,9 @@ import numpy as np
 import warnings
 from streamlit_gsheets import GSheetsConnection
 
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
 warnings.filterwarnings(
     "ignore",
     category=FutureWarning,
@@ -27,22 +30,26 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---------- Google Sheets connection ----------
+# -----------------------------------------------------------------------------
+# Google Sheets connection
+# -----------------------------------------------------------------------------
 conn = st.connection("gsheets", type=GSheetsConnection)
-
-# Expect this to exist in secrets.toml:
-# [connections.gsheets]
-# spreadsheet = "https://docs.google.com/spreadsheets/d/...."
-SPREADSHEET = st.secrets["connections"]["gsheets"]["spreadsheet"]
+SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 
 
-# ---------- Helpers ----------
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+CANON_VIEW_COLS = ["Time", "Sensor ID", "Temperature", "Humidity"]
+CANON_SHEET_COLS = ["Row"] + CANON_VIEW_COLS
+
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Supports two layouts:
-      A) Time, Sensor ID, Temperature, Humidity
-      B) Row, Time, Sensor ID, Temperature, Humidity   (recommended)
-    Renames by *position* to avoid header mismatch issues.
+    Accepts either:
+      - 4 cols: Time, Sensor ID, Temperature, Humidity
+      - 5+ cols: Row, Time, Sensor ID, Temperature, Humidity, ...
+    Renames first columns by position to canonical names.
     """
     df = df.copy()
     cols = list(df.columns)
@@ -55,25 +62,23 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
             cols[3]: "Temperature",
             cols[4]: "Humidity",
         }
-        return df.rename(columns=rename_map)
-
-    if len(cols) >= 4:
+        df = df.rename(columns=rename_map)
+    elif len(cols) >= 4:
         rename_map = {
             cols[0]: "Time",
             cols[1]: "Sensor ID",
             cols[2]: "Temperature",
             cols[3]: "Humidity",
         }
-        return df.rename(columns=rename_map)
+        df = df.rename(columns=rename_map)
 
     return df
 
 
 def ensure_row_column(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Ensures there is a 'Row' column and it is filled with integers.
-    - Existing Row values are preserved.
-    - Missing Row values are auto-assigned (max+1 ...).
+    Ensures df has a valid, fully populated integer Row column.
+    Existing Row values are respected when possible; missing ones get filled.
     """
     df = df.copy()
 
@@ -97,23 +102,19 @@ def ensure_row_column(df: pd.DataFrame) -> pd.DataFrame:
 def process_data(df_input: pd.DataFrame) -> pd.DataFrame:
     df = df_input.copy()
 
-    # Keep Row numeric if present
-    if "Row" in df.columns:
-        df["Row"] = pd.to_numeric(df["Row"], errors="coerce")
-
-    # --- Time cleanup + forward-fill ---
+    # Time: strip, NaN normalize, forward fill
     if "Time" in df.columns:
         df["Time"] = df["Time"].astype(str).str.strip()
         df["Time"] = df["Time"].replace(["nan", "None", "", "NaT"], np.nan)
         df["Time"] = df["Time"].ffill()
 
-    # --- Datetime conversion (fast path + fallback) ---
+    # Datetime: fast HH:MM then fallback
     df["Datetime"] = pd.to_datetime(df.get("Time", pd.Series(dtype="object")), format="%H:%M", errors="coerce")
     mask_nat = df["Datetime"].isna() & df.get("Time", pd.Series(dtype="object")).notna()
     if mask_nat.any():
         df.loc[mask_nat, "Datetime"] = pd.to_datetime(df.loc[mask_nat, "Time"], errors="coerce")
 
-    # --- Numeric conversion + comma decimal support ---
+    # Numeric + comma decimal support
     for col in ["Sensor ID", "Temperature", "Humidity"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.replace(",", ".", regex=False)
@@ -124,41 +125,16 @@ def process_data(df_input: pd.DataFrame) -> pd.DataFrame:
 
 def get_worksheet_titles() -> list[str]:
     """
-    List worksheet/tab names via the underlying gspread client.
-    This uses internal attributes of st-gsheets-connection, but is stable in practice.
+    Lists worksheet/tab names.
+    Uses the underlying gspread client available through the connection.
     """
-    client = conn.client  # underlying GSheetsServiceAccountClient when using service_account
-    # Open spreadsheet using the URL in secrets
-    ss = client._open_spreadsheet(spreadsheet=SPREADSHEET)  # private helper in library
+    client = conn.client
+    ss = client._open_spreadsheet(spreadsheet=SPREADSHEET_URL)
     return [ws.title for ws in ss.worksheets()]
 
 
-# ---------- Sidebar: pick worksheet tab ----------
-st.sidebar.header("Google Sheet tabs")
-
-try:
-    titles = get_worksheet_titles()
-except Exception as e:
-    st.sidebar.error(f"Could not list worksheet tabs: {e}")
-    titles = ["Sheet1"]
-
-selected_ws = st.sidebar.radio(
-    "Select worksheet (tab)",
-    options=titles,
-    index=0 if "Sheet1" not in titles else titles.index("Sheet1"),
-)
-
-refresh = st.sidebar.button("🔄 Refresh", type="secondary")
-if refresh:
-    st.rerun()
-
-# ---------- Load from selected worksheet ----------
-# Use a short ttl so changes appear quickly; gsheets-connection supports ttl on read(). [page:1]
-df_raw = conn.read(worksheet=selected_ws, ttl=5)
-
-# If the tab is empty, create a starter frame
-if df_raw is None or df_raw.empty:
-    df_raw = pd.DataFrame(
+def make_default_df() -> pd.DataFrame:
+    return pd.DataFrame(
         {
             "Row": [1, 2, 3, 4],
             "Time": ["10:00", "", "", ""],
@@ -168,68 +144,117 @@ if df_raw is None or df_raw.empty:
         }
     )
 
+
+# -----------------------------------------------------------------------------
+# Sidebar: worksheet navigation
+# -----------------------------------------------------------------------------
+st.sidebar.header("Google Sheet")
+
+try:
+    worksheet_titles = get_worksheet_titles()
+except Exception as e:
+    st.sidebar.error(f"Could not list worksheet tabs: {e}")
+    worksheet_titles = ["Sheet1"]
+
+selected_ws = st.sidebar.radio(
+    "Worksheet tab",
+    options=worksheet_titles,
+    index=worksheet_titles.index("Sheet1") if "Sheet1" in worksheet_titles else 0,
+)
+
+if st.sidebar.button("🔄 Refresh"):
+    st.rerun()
+
+# -----------------------------------------------------------------------------
+# Load sheet
+# -----------------------------------------------------------------------------
+# Keep ttl low so changes appear quickly. [web:21]
+df_raw = conn.read(worksheet=selected_ws, ttl=5)
+
+if df_raw is None or df_raw.empty:
+    df_raw = make_default_df()
+
 df_raw = normalize_columns(df_raw)
+
+# If sheet has only 4 cols (no Row), add Row internally
 df_raw = ensure_row_column(df_raw)
 
-# ---------- Main UI ----------
+# -----------------------------------------------------------------------------
+# UI
+# -----------------------------------------------------------------------------
 st.title("📊 Sensor Analytics (Cloud)")
 st.caption(f"Active worksheet: {selected_ws}")
 
-c_left, c_right = st.columns([4, 1])
-with c_left:
-    st.subheader("📝 Data Editor")
-    st.caption("Row IDs are auto-managed. Time blanks are forward-filled for analysis.")
-with c_right:
-    save_clicked = st.button("💾 Save", type="primary")  # keep simple; no deprecated width args
+# INTERNAL: always keep a version with Row for saving
+df_internal = df_raw.copy()
 
-edited_df = st.data_editor(
-    df_raw,
+# VIEW: hide Row from UI completely
+df_view = df_internal[CANON_VIEW_COLS].copy()
+
+c1, c2 = st.columns([4, 1])
+with c1:
+    st.subheader("📝 Data Editor")
+    st.caption("Row IDs are managed automatically (hidden). Empty Time cells are forward-filled for analysis.")
+with c2:
+    save_clicked = st.button("💾 Save", type="primary")
+
+# Editor: user edits only the visible columns. [web:21]
+edited_view = st.data_editor(
+    df_view,
     num_rows="dynamic",
     width="stretch",
     key=f"editor_{selected_ws}",
-    column_config={
-        "Row": st.column_config.NumberColumn("Row", help="Auto-generated unique row id", disabled=True),
-    },
 )
 
-# Save: ensure Row IDs exist before writing
+# -----------------------------------------------------------------------------
+# Save back to sheet (Row is re-added automatically)
+# -----------------------------------------------------------------------------
 if save_clicked:
     try:
-        to_save = normalize_columns(edited_df)
-        to_save = ensure_row_column(to_save)
-        # Write back to the chosen worksheet. update() clears then writes the dataframe. [page:1]
+        to_save = edited_view.copy()
+
+        # Always generate Row 1..N (simple, stable, avoids blanks)
+        to_save.insert(0, "Row", range(1, len(to_save) + 1))
+
+        # Ensure canonical column order in the sheet
+        to_save = to_save[CANON_SHEET_COLS]
+
         conn.update(worksheet=selected_ws, data=to_save)
         st.success("Saved to Google Sheets.")
     except Exception as e:
         st.error(f"Save failed: {e}")
 
-# ---------- Build plots ----------
-try:
-    df = process_data(ensure_row_column(normalize_columns(edited_df)))
-    plot_df = df.dropna(subset=["Datetime", "Sensor ID"]).sort_values(["Datetime", "Sensor ID"])
-except Exception as e:
-    st.error(f"Processing error: {e}")
-    plot_df = pd.DataFrame()
+# -----------------------------------------------------------------------------
+# Charts
+# -----------------------------------------------------------------------------
+# Build a processing frame (again: Row exists internally, but irrelevant for plots)
+df_for_processing = edited_view.copy()
+df_for_processing.insert(0, "Row", range(1, len(df_for_processing) + 1))
+
+df = process_data(df_for_processing)
+plot_df = df.dropna(subset=["Datetime", "Sensor ID"]).sort_values(["Datetime", "Sensor ID"])
 
 if plot_df.empty:
     st.warning("No valid data to visualize (check Time + Sensor ID columns).")
     st.stop()
 
+
 def configure_chart(fig):
     fig.update_xaxes(tickformat="%H:%M", showgrid=True)
     return fig
+
 
 st.divider()
 st.subheader("📈 Network averages")
 
 avg_df = plot_df.groupby("Datetime")[["Temperature", "Humidity"]].mean().reset_index()
-col1, col2 = st.columns(2)
+a, b = st.columns(2)
 
 fig_avg_temp = px.area(avg_df, x="Datetime", y="Temperature", title="Avg Temperature (°C)", markers=True)
-col1.plotly_chart(configure_chart(fig_avg_temp), width="stretch", key=f"avg_temp_{selected_ws}")
+a.plotly_chart(configure_chart(fig_avg_temp), width="stretch", key=f"avg_temp_{selected_ws}")
 
 fig_avg_hum = px.area(avg_df, x="Datetime", y="Humidity", title="Avg Humidity (%)", markers=True)
-col2.plotly_chart(configure_chart(fig_avg_hum), width="stretch", key=f"avg_hum_{selected_ws}")
+b.plotly_chart(configure_chart(fig_avg_hum), width="stretch", key=f"avg_hum_{selected_ws}")
 
 st.divider()
 st.subheader("🔍 Individual sensors")
@@ -240,10 +265,10 @@ tabs = st.tabs([f"Sensor {int(s)}" for s in sensors])
 for tab, sid in zip(tabs, sensors):
     with tab:
         s_data = plot_df[plot_df["Sensor ID"] == sid]
-        a, b = st.columns(2)
+        left, right = st.columns(2)
 
         fig_t = px.line(s_data, x="Datetime", y="Temperature", title="Temperature", markers=True)
-        a.plotly_chart(configure_chart(fig_t), width="stretch", key=f"temp_{selected_ws}_{sid}")
+        left.plotly_chart(configure_chart(fig_t), width="stretch", key=f"temp_{selected_ws}_{sid}")
 
         fig_h = px.line(s_data, x="Datetime", y="Humidity", title="Humidity", markers=True)
-        b.plotly_chart(configure_chart(fig_h), width="stretch", key=f"hum_{selected_ws}_{sid}")
+        right.plotly_chart(configure_chart(fig_h), width="stretch", key=f"hum_{selected_ws}_{sid}")
